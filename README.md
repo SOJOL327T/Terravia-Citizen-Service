@@ -29,6 +29,7 @@ The API is versioned at `/v1`. FastAPI's interactive schema is available at `/do
 ## Implemented workflows
 
 - Citizen account registration and sign-in with salted PBKDF2 password hashes, opaque server-side sessions, HttpOnly session cookies, same-site cookies and double-submit CSRF checks.
+- Session listing and revocation, plus an auditable JSON export of the authenticated person's records without password/session secrets.
 - TerraVia Person ID creation distinct from NID and other external IDs.
 - Separate claims, credentials and evidence. Citizen entered values remain `UNVERIFIED`; credentials are references and do not replace issuer records.
 - Conflicting values create an explicit conflict case. Review does not merge claims or select an authoritative value.
@@ -37,10 +38,10 @@ The API is versioned at `/v1`. FastAPI's interactive schema is available at `/do
 - Field-scoped, purpose-bound, time-limited consent with revocation. Transfer requires active consent, a valid request, an idempotency key and a resumed global control.
 - A mock adapter only. Receipts state `MOCK`; no live government or organization integration is configured.
 - Append-only, hash-chained audit events and private activity history.
-- Private family networks, provenance/evidence labels, relationship notes, events, archive items and living-memory records. Family relationships do not grant access.
+- Private family networks with one-use, identity-bound invitation codes; code sharing is manual and no email is sent. Explicit network membership grants only family-visible items. Relationship notes, events, archive items and living-memory records retain provenance labels and do not become official identity claims.
 - Proposed life events and impact recommendations without automatic changes to other domains.
 - Private legacy vault entries with explicit trigger metadata. No release mechanism is exposed, and inactivity is never a trigger.
-- Optional Ollama explanation endpoint. It sends only coarse workflow counts, is unavailable unless a model is configured, and cannot call mutation endpoints.
+- Ollama explanation endpoint discovers local models through loopback only. If `OLLAMA_MODEL` is unset, it selects the first installed local model; if an explicit model is missing, it fails closed. It sends only coarse workflow counts and cannot call mutation endpoints. Outputs are labeled `SUGGESTED` and are non-authoritative.
 
 ## Tests
 

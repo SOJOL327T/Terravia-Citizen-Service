@@ -111,6 +111,22 @@ class NetworkBody(BaseModel):
     name: str = Field(min_length=2, max_length=120)
 
 
+class FamilyInvitationBody(BaseModel):
+    invitee_email: str = Field(min_length=5, max_length=254)
+
+    @field_validator("invitee_email")
+    @classmethod
+    def valid_email(cls, value: str) -> str:
+        value = value.strip().lower()
+        if not re.fullmatch(r"[^\s@]{1,64}@[^\s@.]+(?:\.[^\s@.]+)+", value):
+            raise ValueError("Enter a valid email address")
+        return value
+
+
+class AcceptFamilyInvitationBody(BaseModel):
+    token: str = Field(min_length=32, max_length=100)
+
+
 class RelationshipBody(BaseModel):
     related_label: str = Field(min_length=2, max_length=100)
     relationship_type: str = Field(min_length=2, max_length=80)
@@ -217,10 +233,10 @@ def csrf_guard(user: dict = Depends(user_context), token: str | None = Cookie(de
 
 
 def set_session(response: Response, account_id: str):
-    raw, csrf = secret_token(), secret_token()
+    raw, csrf, session_id = secret_token(), secret_token(), identifier()
     with db.transaction() as conn:
-        conn.execute("INSERT INTO sessions(token_hash,account_id,csrf_hash,created_at,expires_at) VALUES(?,?,?,?,?)",
-                     (digest(raw), account_id, digest(csrf), iso(), expiry()))
+        conn.execute("INSERT INTO sessions(token_hash,account_id,csrf_hash,created_at,expires_at,session_id) VALUES(?,?,?,?,?,?)",
+                     (digest(raw), account_id, digest(csrf), iso(), expiry(), session_id))
         audit.record(conn, actor=account_id, action="SESSION_CREATED", object_type="session", result="SUCCESS")
     response.set_cookie("tv_session", raw, httponly=True, secure=COOKIE_SECURE, samesite="strict", max_age=8 * 3600, path="/")
     response.set_cookie("tv_csrf", csrf, httponly=False, secure=COOKIE_SECURE, samesite="strict", max_age=8 * 3600, path="/")
@@ -315,6 +331,29 @@ def logout(response: Response, user: dict = Depends(csrf_guard), tv_session: str
 @app.get("/v1/me")
 def me(user: dict = Depends(user_context)):
     return {"person_id": user["person_id"], "email": user["email"], "identity_type": "TERRAVIA_PERSON_ID", "status": user["person_status"]}
+
+
+@app.get("/v1/sessions")
+def list_sessions(user: dict = Depends(user_context), tv_session: str | None = Cookie(default=None)):
+    conn = request_db()
+    try:
+        rows = conn.execute("SELECT session_id,created_at,expires_at,token_hash FROM sessions WHERE account_id=? AND expires_at>? ORDER BY created_at DESC", (user["account_id"], iso())).fetchall()
+        return [{"id": row["session_id"], "created_at": row["created_at"], "expires_at": row["expires_at"],
+                 "current": safe_compare(row["token_hash"], digest(tv_session or ""))} for row in rows]
+    finally:
+        conn.close()
+
+
+@app.post("/v1/sessions/{session_id}/revoke")
+def revoke_session(session_id: str, request: Request, user: dict = Depends(csrf_guard)):
+    with db.transaction() as conn:
+        row = conn.execute("SELECT token_hash FROM sessions WHERE session_id=? AND account_id=?", (session_id, user["account_id"])).fetchone()
+        if not row:
+            error("SESSION_NOT_FOUND", "The session was not found.", "AUTHORIZATION", 404)
+        conn.execute("DELETE FROM sessions WHERE session_id=? AND account_id=?", (session_id, user["account_id"]))
+        audit.record(conn, actor=user["account_id"], action="SESSION_REVOKED", object_type="session", object_id=session_id,
+                     correlation_id=request.state.correlation_id)
+    return {"id": session_id, "status": "REVOKED", "current_session": safe_compare(row["token_hash"], digest(request.cookies.get("tv_session", "")))}
 
 
 @app.get("/v1/persons/{person_id}")
@@ -688,20 +727,67 @@ def own_network(conn, network_id: str, person_id: str):
     return dict(row)
 
 
+def accessible_network(conn, network_id: str, person_id: str):
+    row = conn.execute("""SELECT n.*,m.role member_role FROM family_networks n
+        JOIN family_members m ON m.network_id=n.id WHERE n.id=? AND m.person_id=?""", (network_id, person_id)).fetchone()
+    if not row:
+        error("NOT_FOUND", "The private family network was not found.", "AUTHORIZATION", 404)
+    return dict(row)
+
+
 @app.get("/v1/family/networks")
 def list_family_networks(user: dict = Depends(user_context)):
     conn = request_db()
     try:
-        return [dict(r) for r in conn.execute("SELECT id,name,visibility,created_at FROM family_networks WHERE owner_person_id=?", (user["person_id"],)).fetchall()]
+        return [dict(r) for r in conn.execute("""SELECT n.id,n.name,n.visibility,n.owner_person_id,m.role, n.created_at
+            FROM family_networks n JOIN family_members m ON m.network_id=n.id
+            WHERE m.person_id=? ORDER BY n.created_at DESC""", (user["person_id"],)).fetchall()]
     finally:
         conn.close()
+
+
+@app.post("/v1/family/networks/{network_id}/invitations", status_code=201)
+def create_family_invitation(network_id: str, body: FamilyInvitationBody, request: Request, user: dict = Depends(csrf_guard)):
+    invitation_id, token, invitation_expires_at = identifier(), secret_token(), expiry(72)
+    with db.transaction() as conn:
+        own_network(conn, network_id, user["person_id"])
+        if body.invitee_email.casefold() == user["email"].casefold():
+            error("INVITATION_SELF", "You are already a member of your network.", "VALIDATION", 422)
+        existing = conn.execute("SELECT id FROM accounts WHERE email=? COLLATE NOCASE", (body.invitee_email,)).fetchone()
+        if existing:
+            member = conn.execute("SELECT 1 FROM family_members WHERE network_id=? AND person_id=(SELECT person_id FROM accounts WHERE id=?)", (network_id, existing["id"])).fetchone()
+            if member:
+                error("MEMBER_EXISTS", "This person is already a network member.", "CONFLICT", 409)
+        conn.execute("INSERT INTO family_invitations(id,network_id,inviter_account_id,invitee_email,token_hash,status,expires_at,created_at) VALUES(?,?,?,?,?,'PENDING',?,?)",
+                     (invitation_id, network_id, user["account_id"], body.invitee_email, digest(token), invitation_expires_at, iso()))
+        audit.record(conn, actor=user["account_id"], action="FAMILY_INVITATION_CREATED", object_type="family_invitation", object_id=invitation_id,
+                     correlation_id=request.state.correlation_id, result="MANUAL_OUT_OF_BAND")
+    return {"id": invitation_id, "invitee_email": body.invitee_email, "status": "PENDING", "token": token,
+            "expires_at": invitation_expires_at, "delivery": "MANUAL_OUT_OF_BAND; TerraVia sent no email or message"}
+
+
+@app.post("/v1/family/invitations/accept")
+def accept_family_invitation(body: AcceptFamilyInvitationBody, request: Request, user: dict = Depends(csrf_guard)):
+    with db.transaction() as conn:
+        invitation = conn.execute("SELECT * FROM family_invitations WHERE token_hash=? AND status='PENDING'", (digest(body.token),)).fetchone()
+        if not invitation or invitation["expires_at"] <= iso():
+            error("INVITATION_INVALID", "This invitation is invalid, expired, or already used.", "AUTHORIZATION", 403)
+        if invitation["invitee_email"].casefold() != user["email"].casefold():
+            return audited_denial(conn, user, request, "INVITATION_IDENTITY_MISMATCH", "Sign in with the email address the invitation was created for.",
+                                  "AUTHORIZATION", 403, object_type="family_invitation", object_id=invitation["id"])
+        conn.execute("INSERT INTO family_members(network_id,person_id,role,joined_at) VALUES(?,?,'Member',?)",
+                     (invitation["network_id"], user["person_id"], iso()))
+        conn.execute("UPDATE family_invitations SET status='ACCEPTED',accepted_by_person_id=? WHERE id=?", (user["person_id"], invitation["id"]))
+        audit.record(conn, actor=user["account_id"], action="FAMILY_INVITATION_ACCEPTED", object_type="family_network", object_id=invitation["network_id"],
+                     correlation_id=request.state.correlation_id, result="MEMBER_ADDED")
+    return {"network_id": invitation["network_id"], "status": "JOINED", "role": "Member", "relationship_based_access": False}
 
 
 @app.post("/v1/family/networks/{network_id}/relationships", status_code=201)
 def add_relationship(network_id: str, body: RelationshipBody, request: Request, user: dict = Depends(csrf_guard)):
     relationship_id = identifier()
     with db.transaction() as conn:
-        own_network(conn, network_id, user["person_id"])
+        accessible_network(conn, network_id, user["person_id"])
         conn.execute("INSERT INTO relationships(id,network_id,subject_person_id,related_label,relationship_type,evidence_level,state,visibility,created_at) VALUES(?,?,?,?,?,?,?,'FAMILY',?)",
                      (relationship_id, network_id, user["person_id"], body.related_label, body.relationship_type, body.evidence_level, body.state, iso()))
         audit.record(conn, actor=user["account_id"], action="FAMILY_RELATIONSHIP_RECORDED", object_type="relationship", object_id=relationship_id, correlation_id=request.state.correlation_id, result=body.evidence_level)
@@ -712,8 +798,8 @@ def add_relationship(network_id: str, body: RelationshipBody, request: Request, 
 def list_relationships(network_id: str, user: dict = Depends(user_context)):
     conn = request_db()
     try:
-        own_network(conn, network_id, user["person_id"])
-        return [dict(r) for r in conn.execute("SELECT id,related_label,relationship_type,evidence_level,state,visibility,created_at FROM relationships WHERE network_id=?", (network_id,)).fetchall()]
+        accessible_network(conn, network_id, user["person_id"])
+        return [dict(r) for r in conn.execute("SELECT id,related_label,relationship_type,evidence_level,state,visibility,created_at FROM relationships WHERE network_id=? AND visibility='FAMILY'", (network_id,)).fetchall()]
     finally:
         conn.close()
 
@@ -722,7 +808,9 @@ def list_relationships(network_id: str, user: dict = Depends(user_context)):
 def add_family_item(network_id: str, body: FamilyItemBody, request: Request, user: dict = Depends(csrf_guard)):
     item_id = identifier()
     with db.transaction() as conn:
-        own_network(conn, network_id, user["person_id"])
+        network = accessible_network(conn, network_id, user["person_id"])
+        if body.visibility == "PRIVATE" and network["owner_person_id"] != user["person_id"]:
+            error("FAMILY_ITEM_PRIVATE", "Only the network owner can create a private network item.", "AUTHORIZATION", 403)
         conn.execute("INSERT INTO family_items(id,network_id,owner_person_id,item_type,title,content,evidence_level,certainty,visibility,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
                      (item_id, network_id, user["person_id"], body.item_type, body.title, body.content, body.evidence_level, body.certainty, body.visibility, iso()))
         audit.record(conn, actor=user["account_id"], action="FAMILY_ITEM_ADDED", object_type=body.item_type.lower(), object_id=item_id,
@@ -734,8 +822,8 @@ def add_family_item(network_id: str, body: FamilyItemBody, request: Request, use
 def list_family_items(network_id: str, user: dict = Depends(user_context)):
     conn = request_db()
     try:
-        own_network(conn, network_id, user["person_id"])
-        return [dict(r) for r in conn.execute("SELECT id,item_type,title,evidence_level,certainty,visibility,created_at FROM family_items WHERE network_id=?", (network_id,)).fetchall()]
+        accessible_network(conn, network_id, user["person_id"])
+        return [dict(r) for r in conn.execute("SELECT id,item_type,title,evidence_level,certainty,visibility,created_at FROM family_items WHERE network_id=? AND (visibility='FAMILY' OR owner_person_id=?)", (network_id, user["person_id"])).fetchall()]
     finally:
         conn.close()
 
@@ -832,29 +920,100 @@ def list_audit(user: dict = Depends(user_context)):
         conn.close()
 
 
-@app.post("/v1/assistant/explain")
-async def explain(request: Request, user: dict = Depends(csrf_guard)):
-    """Optional Ollama explanation using non-sensitive workflow status only."""
+@app.get("/v1/export")
+def export_personal_data(request: Request, response: Response, user: dict = Depends(user_context)):
+    """Export only records the authenticated person owns or can currently see."""
+    with db.transaction() as conn:
+        networks = conn.execute("""SELECT n.id,n.name,n.visibility,n.owner_person_id,m.role FROM family_networks n
+            JOIN family_members m ON m.network_id=n.id WHERE m.person_id=?""", (user["person_id"],)).fetchall()
+        family_export = []
+        for network in networks:
+            network_id = network["id"]
+            relationships = conn.execute("SELECT id,related_label,relationship_type,evidence_level,state,visibility,created_at FROM relationships WHERE network_id=? AND visibility='FAMILY'", (network_id,)).fetchall()
+            items = conn.execute("SELECT id,item_type,title,content,evidence_level,certainty,visibility,created_at FROM family_items WHERE network_id=? AND (visibility='FAMILY' OR owner_person_id=?)", (network_id, user["person_id"])).fetchall()
+            family_export.append({"network": dict(network), "relationships": [dict(r) for r in relationships], "items": [dict(r) for r in items]})
+        vault = conn.execute("SELECT * FROM legacy_vaults WHERE owner_person_id=?", (user["person_id"],)).fetchone()
+        legacy = []
+        if vault:
+            legacy = [dict(r) for r in conn.execute("SELECT id,title,content,classification,release_mode,trigger_type,custodians_json,released_at,created_at FROM legacy_items WHERE vault_id=?", (vault["id"],)).fetchall()]
+        audit.record(conn, actor=user["account_id"], action="PERSONAL_DATA_EXPORTED", object_type="person", object_id=user["person_id"],
+                     correlation_id=request.state.correlation_id, result="SUCCESS")
+        export = {
+            "export_version": "v1", "exported_at": iso(),
+            "person": {"person_id": user["person_id"], "email": user["email"], "status": user["person_status"]},
+            "claims": [dict(r) | {"value": json.loads(r["value_json"])} for r in conn.execute("SELECT id,attribute,value_json,source_type,source_reference,assurance,verification_status,status,created_at FROM claims WHERE person_id=?", (user["person_id"],)).fetchall()],
+            "credentials": [dict(r) for r in conn.execute("SELECT id,type,issuer,external_identifier,issued_at,expires_at,verification_status,source_reference,created_at FROM credentials WHERE person_id=?", (user["person_id"],)).fetchall()],
+            "evidence": [dict(r) for r in conn.execute("SELECT id,claim_id,credential_id,source_type,source_reference,captured_at,verification_method,assurance_level,evidence_status,artifact_hash FROM evidence WHERE person_id=?", (user["person_id"],)).fetchall()],
+            "identity_conflicts": [dict(r) | {"claim_ids": json.loads(r["claim_ids_json"])} for r in conn.execute("SELECT id,attribute,claim_ids_json,state,resolution_reference,opened_at,updated_at FROM conflicts WHERE person_id=?", (user["person_id"],)).fetchall()],
+            "applications": [dict(r) | {"readiness": json.loads(r["readiness_json"])} for r in conn.execute("SELECT id,service_id,status,readiness_json,created_at,updated_at FROM applications WHERE person_id=?", (user["person_id"],)).fetchall()],
+            "data_requests": [dict(r) | {"requested_fields": json.loads(r["requested_fields_json"])} for r in conn.execute("SELECT id,requester,purpose,legal_basis,requested_fields_json,expires_at,policy_outcome,policy_reason,status,created_at FROM data_requests WHERE person_id=?", (user["person_id"],)).fetchall()],
+            "consents": [dict(r) | {"scope": json.loads(r["scope_json"])} for r in conn.execute("SELECT id,request_id,requester,purpose,legal_basis,scope_json,presented_version,granted_at,expires_at,status FROM consents WHERE person_id=?", (user["person_id"],)).fetchall()],
+            "transfers": [dict(r) | {"fields": json.loads(r["fields_json"]), "receipt": json.loads(r["receipt_json"]), "package": json.loads(r["package_json"])} for r in conn.execute("SELECT id,request_id,adapter_id,adapter_mode,fields_json,package_json,receipt_json,created_at FROM transfers WHERE person_id=?", (user["person_id"],)).fetchall()],
+            "family": family_export,
+            "life_events": [dict(r) | {"evidence_references": json.loads(r["evidence_json"]), "impact_analysis": json.loads(r["impact_json"])} for r in conn.execute("SELECT id,event_type,occurred_range,evidence_json,risk,state,impact_json,created_at,updated_at FROM life_events WHERE person_id=?", (user["person_id"],)).fetchall()],
+            "legacy_vault": {"vault": dict(vault) if vault else None, "items": legacy},
+            "notifications": [dict(r) for r in conn.execute("SELECT id,category,message,sensitive,acknowledged_at,created_at FROM notifications WHERE person_id=?", (user["person_id"],)).fetchall()],
+            "activity": [dict(r) for r in conn.execute("SELECT timestamp,action,object_type,object_id,purpose,result,correlation_id,event_hash FROM audit_events WHERE actor=? ORDER BY rowid", (user["account_id"],)).fetchall()],
+        }
+    response.headers["Content-Disposition"] = 'attachment; filename="terravia-personal-data-v1.json"'
+    return export
+
+
+def ollama_config() -> tuple[str, str | None]:
     base = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
-    model = os.environ.get("OLLAMA_MODEL", "")
-    if not model:
-        error("AI_UNAVAILABLE", "No Ollama model is configured. The governed service remains available without AI.", "SOURCE_UNAVAILABLE", 503, retryable=True)
     endpoint = urllib.parse.urlparse(base)
     if endpoint.scheme != "http" or endpoint.hostname not in {"localhost", "127.0.0.1", "::1"} or endpoint.username or endpoint.password:
         error("AI_CONFIGURATION_INVALID", "Ollama must be configured on this machine over loopback HTTP.", "VALIDATION", 503)
+    return base, os.environ.get("OLLAMA_MODEL") or None
+
+
+def ollama_models(base: str, timeout: float = 4.0) -> list[str]:
+    req = urllib.request.Request(base + "/api/tags", headers={"Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        result = json.loads(response.read().decode())
+    return [row["name"] for row in result.get("models", []) if isinstance(row, dict) and isinstance(row.get("name"), str)]
+
+
+@app.get("/v1/assistant/status")
+async def assistant_status(user: dict = Depends(user_context)):
+    try:
+        base, configured_model = ollama_config()
+        models = await asyncio.to_thread(ollama_models, base)
+        selected = (configured_model if configured_model in models else None) if configured_model else (models[0] if models else None)
+        status = "AVAILABLE" if selected else ("NO_MODELS" if not models else "CONFIGURED_MODEL_MISSING")
+        return {"provider": "OLLAMA", "status": status,
+                "configured_model": configured_model, "selected_model": selected, "models": models,
+                "authoritative": False}
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return {"provider": "OLLAMA", "status": "UNAVAILABLE", "configured_model": os.environ.get("OLLAMA_MODEL"),
+                "selected_model": None, "models": [], "authoritative": False}
+
+
+@app.post("/v1/assistant/explain")
+async def explain(request: Request, user: dict = Depends(csrf_guard)):
+    """Optional Ollama explanation using non-sensitive workflow status only."""
+    base, configured_model = ollama_config()
+    try:
+        models = await asyncio.to_thread(ollama_models, base)
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        error("AI_UNAVAILABLE", "The local Ollama service did not respond. No workflow action was taken.", "SOURCE_UNAVAILABLE", 503, retryable=True)
+    model = (configured_model if configured_model in models else None) if configured_model else (models[0] if models else None)
+    if not model:
+        message = "The configured Ollama model is not installed." if configured_model else "Ollama is reachable, but no local model is installed."
+        error("AI_UNAVAILABLE", message, "SOURCE_UNAVAILABLE", 503, retryable=True)
     conn = request_db()
     try:
-        counts = {"open_conflicts": conn.execute("SELECT count(*) FROM conflicts WHERE person_id=? AND state IN ('OPEN','UNDER_REVIEW','DISPUTED')", (user["person_id"],)).fetchone()[0],
-                  "applications": conn.execute("SELECT count(*) FROM applications WHERE person_id=?", (user["person_id"],)).fetchone()[0],
-                  "pending_requests": conn.execute("SELECT count(*) FROM data_requests WHERE person_id=? AND status='AWAITING_CITIZEN_REVIEW'", (user["person_id"],)).fetchone()[0]}
+        counts = {"open_identity_conflict_cases": conn.execute("SELECT count(*) FROM conflicts WHERE person_id=? AND state IN ('OPEN','UNDER_REVIEW','DISPUTED')", (user["person_id"],)).fetchone()[0],
+                  "application_records_total": conn.execute("SELECT count(*) FROM applications WHERE person_id=?", (user["person_id"],)).fetchone()[0],
+                  "data_requests_waiting_for_citizen_review": conn.execute("SELECT count(*) FROM data_requests WHERE person_id=? AND status='AWAITING_CITIZEN_REVIEW'", (user["person_id"],)).fetchone()[0]}
     finally:
         conn.close()
     payload = json.dumps({"model": model, "stream": False, "messages": [
-        {"role": "system", "content": "Explain TerraVia workflow status in plain language. You are non-authoritative. Never recommend bypassing consent, policy, human review, or STOP ALL AUTOMATION. Do not infer identity or legal facts."},
-        {"role": "user", "content": f"Explain this non-sensitive workflow summary: {json.dumps(counts)}. Do not ask for private identity data."}]})
+        {"role": "system", "content": "You explain TerraVia database counts, not legal or identity facts. Return exactly one short bullet for each supplied metric, in the same order. Use the exact category in each key: identity conflict cases, application records, and data requests waiting for citizen review. Do not move a status from one metric to another. Application records are a total count and have no status in this summary. A zero means only zero records matched that named query; never infer completion, approval, readiness, system health, eligibility, verification, or truth. Do not recommend bypassing policy, consent, human review, or STOP ALL AUTOMATION."},
+        {"role": "user", "content": f"Explain these exact non-sensitive counts in plain language: {json.dumps(counts)}. Do not ask for personal data."}]})
     def call_ollama():
         req = urllib.request.Request(base + "/api/chat", data=payload.encode(), headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(req, timeout=5) as response:
+        with urllib.request.urlopen(req, timeout=60) as response:
             return json.loads(response.read().decode())
     try:
         result = await asyncio.to_thread(call_ollama)

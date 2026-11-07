@@ -39,10 +39,10 @@
   let serviceCache = [];
   async function refresh() {
     try {
-      const [me, person, conflicts, services, requests, transfers, applications, networks, events, vault, auditEvents, control] = await Promise.all([
+      const [me, person, conflicts, services, requests, transfers, applications, networks, events, vault, auditEvents, control, sessions] = await Promise.all([
         api('/v1/me'), api(`/v1/persons/${encodeURIComponent((await api('/v1/me')).person_id)}`), api('/v1/conflicts'), api('/v1/services'),
         api('/v1/data-requests'), api('/v1/transfers'), api('/v1/applications'), api('/v1/family/networks'),
-        api('/v1/life-events'), api('/v1/legacy/vault'), api('/v1/audit'), api('/v1/controls/automation')
+        api('/v1/life-events'), api('/v1/legacy/vault'), api('/v1/audit'), api('/v1/controls/automation'), api('/v1/sessions')
       ]);
       $('#claim-count').textContent = person.claims.length; $('#credential-count').textContent = person.credentials.length;
       $('#review-count').textContent = conflicts.filter(c => c.state !== 'RESOLVED').length + requests.filter(r => r.status === 'AWAITING_CITIZEN_REVIEW').length;
@@ -69,7 +69,7 @@
       }, 'No data requests.');
       list('#transfers-list', transfers, t => record(`${t.receipt.recipient} · ${t.adapter_mode}`, `${t.receipt.fields.join(', ')} · ${t.receipt.transferred_at}`, t.receipt.status, 'mock'), 'No transfers have been made.');
       list('#applications-list', applications, a => record(a.service_name, `${a.readiness.status} · Missing: ${a.readiness.missing_fields.join(', ')||'none'}${a.readiness.conflicted_fields.length?` · Conflicts: ${a.readiness.conflicted_fields.join(', ')}`:''}`, a.adapter_mode, 'mock'), 'No applications prepared.');
-      fillNetworkSelects(networks);
+      fillNetworkSelects(networks,me.person_id);
       list('#networks-list', networks, n => record(n.name, `Private · Created ${n.created_at}`, 'PRIVATE', 'private'), 'No family networks yet.');
       const familyItems=[]; for(const n of networks){ const [relationships,items]=await Promise.all([api(`/v1/family/networks/${n.id}/relationships`),api(`/v1/family/networks/${n.id}/items`)]); relationships.forEach(x=>familyItems.push({...x,title:`${x.related_label} · ${x.relationship_type}`,item_type:'Relationship'})); items.forEach(x=>familyItems.push(x)); }
       list('#family-items-list', familyItems, x=>record(x.title, `${x.item_type||'Relationship'} · ${x.evidence_level||''} · ${x.certainty||x.state||''}`, x.visibility||'FAMILY','private'), 'No family notes yet.');
@@ -78,13 +78,14 @@
       if(vault.status==='NOT_CREATED') $('#vault-view').append(element('div','empty','Create a vault to begin.'));
       else { $('#vault-view').append(element('p','muted',`${vault.status} · Releases require explicit authorized trigger review.`)); list('#vault-view', vault.items, i=>record(i.title,`${i.classification} · ${i.release_mode} · Trigger ${i.trigger_type}`,i.released_at?'RELEASED':'PRIVATE','private'),'No legacy items yet.'); }
       list('#audit-list', auditEvents, e=>record(e.action,`${e.timestamp} · ${e.object_type}${e.purpose?` · ${e.purpose}`:''}`,e.result,''),'No activity yet.');
+      list('#sessions-list',sessions,s=>{const n=record(`${s.current?'This device · current':'Signed-in session · '+s.id.slice(0,8)}`,`Created ${s.created_at} · Expires ${s.expires_at}`,s.current?'CURRENT':'ACTIVE',s.current?'':'review');if(!s.current){const b=element('button','quiet','Revoke session');b.type='button';b.addEventListener('click',()=>actionThen(`/v1/sessions/${s.id}/revoke`,'POST',{},refresh));n.append(b);}return n;},'No active sessions.');
     } catch (err) { notice(err.message, 'error'); }
   }
   async function awaitConsent(requestId) {
     const rows = await api('/v1/data-requests'); const r=rows.find(x=>x.id===requestId); if(!r)return null;
     return r.active_consent ? {id:r.active_consent.id} : null;
   }
-  function fillNetworkSelects(networks){ ['#relationship-network','#item-network'].forEach(sel=>{const node=$(sel);node.replaceChildren();networks.forEach(n=>{const o=element('option','',n.name);o.value=n.id;node.append(o);});}); }
+  function fillNetworkSelects(networks,personId){ ['#relationship-network','#item-network'].forEach(sel=>{const node=$(sel);node.replaceChildren();networks.forEach(n=>{const o=element('option','',n.name);o.value=n.id;node.append(o);});}); const owners=$('#invite-network');owners.replaceChildren();networks.filter(n=>n.owner_person_id===personId).forEach(n=>{const o=element('option','',n.name);o.value=n.id;owners.append(o);}); }
   async function action(path, method='POST', body={}, headers={}) { try { const result=await api(path,{method,body:JSON.stringify(body),headers}); notice(result?.id?`Saved. Record ${result.id.slice(0,8)}…`:'Action completed.'); return result; } catch(err){ notice(err.message,'error'); return null; } }
   async function actionThen(path, method, body, done){const result=await action(path,method,body);if(result)await done(result);}
 
@@ -93,12 +94,15 @@
   $('#auth-form').addEventListener('submit',async e=>{e.preventDefault();const body=formValues(e.currentTarget);try{await api(authMode==='create'?'/v1/auth/register':'/v1/auth/login',{method:'POST',body:JSON.stringify(body)});await showWorkspace();}catch(err){notice(err.message,'error');}});
   $('#signout').addEventListener('click',async()=>{try{await api('/v1/auth/logout',{method:'POST',body:'{}'});}catch{}showAuth();});
   $('#refresh').addEventListener('click',refresh);
-  $$('.section-nav button').forEach(b=>b.addEventListener('click',()=>{ $$('.section-nav button').forEach(x=>x.classList.toggle('selected',x===b)); $$('.panel').forEach(x=>x.classList.toggle('active',x.id===b.dataset.section)); }));
+  async function ollamaStatus(){const target=$('#ollama-state');try{const s=await api('/v1/assistant/status');target.textContent=s.status==='AVAILABLE'?`available · ${s.selected_model} · local Ollama`:`${s.status.toLowerCase()} · explanations unavailable`; }catch{target.textContent='status unavailable';}}
+  $$('.section-nav button').forEach(b=>b.addEventListener('click',()=>{ $$('.section-nav button').forEach(x=>x.classList.toggle('selected',x===b)); $$('.panel').forEach(x=>x.classList.toggle('active',x.id===b.dataset.section)); if(b.dataset.section==='activity')ollamaStatus(); }));
   $$('[data-jump]').forEach(b=>b.addEventListener('click',()=>{const section=b.dataset.jump;$$('.section-nav button').find(x=>x.dataset.section===section)?.click();}));
   $('#claim-form').addEventListener('submit',e=>{e.preventDefault();const v=formValues(e.currentTarget);const value=v.value;actionThen('/v1/claims','POST',{...v,value},refresh);e.currentTarget.reset();});
   $('#credential-form').addEventListener('submit',e=>{e.preventDefault();actionThen('/v1/credentials','POST',formValues(e.currentTarget),refresh);e.currentTarget.reset();});
   $('#request-form').addEventListener('submit',e=>{e.preventDefault();const v=formValues(e.currentTarget);const fields=[...e.currentTarget.elements.requested_fields.selectedOptions].map(o=>o.value);const requester=$('#request-service').selectedOptions[0]?.dataset.organization||'';actionThen('/v1/data-requests','POST',{...v,requester,requested_fields:fields,legal_basis:'CONSENT'},refresh);});
   $('#network-form').addEventListener('submit',e=>{e.preventDefault();actionThen('/v1/family/networks','POST',formValues(e.currentTarget),refresh);e.currentTarget.reset();});
+  $('#invite-form').addEventListener('submit',async e=>{e.preventDefault();const v=formValues(e.currentTarget);const id=v.network_id;delete v.network_id;try{const r=await api(`/v1/family/networks/${id}/invitations`,{method:'POST',body:JSON.stringify(v)});const box=$('#invite-token-display');box.textContent=`One-use code for ${r.invitee_email} (expires ${r.expires_at}): ${r.token}. No message was sent.`;box.classList.remove('hidden');notice('Invitation created. Share the code only with the intended person.');e.currentTarget.reset();}catch(err){notice(err.message,'error');}});
+  $('#accept-invite-form').addEventListener('submit',e=>{e.preventDefault();actionThen('/v1/family/invitations/accept','POST',formValues(e.currentTarget),refresh);e.currentTarget.reset();});
   $('#relationship-form').addEventListener('submit',e=>{e.preventDefault();const v=formValues(e.currentTarget);const id=v.network_id;delete v.network_id;actionThen(`/v1/family/networks/${id}/relationships`,'POST',v,refresh);e.currentTarget.reset();});
   $('#family-item-form').addEventListener('submit',e=>{e.preventDefault();const v=formValues(e.currentTarget);const id=v.network_id;delete v.network_id;actionThen(`/v1/family/networks/${id}/items`,'POST',v,refresh);e.currentTarget.reset();});
   $('#life-form').addEventListener('submit',e=>{e.preventDefault();const v=formValues(e.currentTarget);v.affected_domains=(v.affected_domains||'').split(',').map(x=>x.trim()).filter(Boolean);v.evidence_references=[];actionThen('/v1/life-events','POST',v,refresh);e.currentTarget.reset();});
@@ -106,6 +110,7 @@
   $('#legacy-form').addEventListener('submit',e=>{e.preventDefault();actionThen('/v1/legacy/items','POST',formValues(e.currentTarget),refresh);e.currentTarget.reset();});
   $('#stop-control').addEventListener('click',async()=>{if(confirm('Stop all outbound transfers across TerraVia?'))await actionThen('/v1/controls/automation/stop','POST',{},refresh);});
   $('#resume-control').addEventListener('click',async()=>{const control_key=prompt('Enter the platform control key. It is never stored in the browser.');if(!control_key)return;try{await api('/v1/controls/automation/resume',{method:'POST',body:'{}',headers:{'X-Control-Key':control_key}});notice('Outbound transfers resumed.');await refresh();}catch(err){notice(err.message,'error');}});
-  $('#explain').addEventListener('click',async()=>{const target=$('#assistant-result');target.classList.remove('hidden');target.textContent='Contacting configured local Ollama…';try{const r=await api('/v1/assistant/explain',{method:'POST',body:'{}'});target.replaceChildren(element('strong','','Suggested explanation · Ollama'));target.append(element('p','',r.text));}catch(err){target.textContent=err.message;}});
+  $('#explain').addEventListener('click',async()=>{const target=$('#assistant-result');target.classList.remove('hidden');target.textContent='Contacting local Ollama…';try{const r=await api('/v1/assistant/explain',{method:'POST',body:'{}'});target.replaceChildren(element('strong','','Suggested explanation · Ollama'));target.append(element('p','',r.text));}catch(err){target.textContent=err.message;}});
+  $('#export-data').addEventListener('click',async()=>{try{const data=await api('/v1/export');const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});const link=element('a');link.href=URL.createObjectURL(blob);link.download='terravia-personal-data-v1.json';document.body.append(link);link.click();link.remove();URL.revokeObjectURL(link.href);notice('Your JSON export is ready.');}catch(err){notice(err.message,'error');}});
   api('/v1/me').then(showWorkspace).catch(showAuth);
 })();

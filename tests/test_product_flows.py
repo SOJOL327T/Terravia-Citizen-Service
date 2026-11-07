@@ -70,7 +70,7 @@ def test_revoked_consent_blocks_transfer(signed_in):
     assert denied.status_code == 403
 
 
-def test_family_relationship_does_not_grant_access(signed_in):
+def test_family_relationship_does_not_grant_access_until_explicit_invitation(signed_in):
     client, _ = signed_in
     network = client.post("/v1/family/networks", headers=csrf(client), json={"name": "Private family"}).json()
     relationship = client.post(f"/v1/family/networks/{network['id']}/relationships", headers=csrf(client), json={
@@ -78,10 +78,30 @@ def test_family_relationship_does_not_grant_access(signed_in):
     assert relationship.status_code == 201
     assert relationship.json()["grants_access"] is False
     assert client.get(f"/v1/family/networks/{network['id']}/relationships").status_code == 200
-    other = client.post("/v1/auth/register", json={"email": "other@example.test", "password": "a-different-password-123"})
-    assert other.status_code == 201
+    for visibility in ("PRIVATE", "FAMILY"):
+        item = client.post(f"/v1/family/networks/{network['id']}/items", headers=csrf(client), json={
+            "item_type": "ARCHIVE", "title": visibility, "content": "family record", "evidence_level": "FAMILY_SUPPORTED",
+            "certainty": "UNCERTAIN", "visibility": visibility})
+        assert item.status_code == 201
+    invitation = client.post(f"/v1/family/networks/{network['id']}/invitations", headers=csrf(client), json={"invitee_email": "invitee@example.test"})
+    assert invitation.status_code == 201
+    assert invitation.json()["delivery"].startswith("MANUAL_OUT_OF_BAND")
+    outsider = client.post("/v1/auth/register", json={"email": "other@example.test", "password": "a-different-password-123"})
+    assert outsider.status_code == 201
     denied = client.get(f"/v1/family/networks/{network['id']}/relationships")
     assert denied.status_code == 404
+    wrong_invitee = client.post("/v1/family/invitations/accept", headers=csrf(client), json={"token": invitation.json()["token"]})
+    assert wrong_invitee.status_code == 403
+    invitee = client.post("/v1/auth/register", json={"email": "invitee@example.test", "password": "another-strong-password-123"})
+    assert invitee.status_code == 201
+    joined = client.post("/v1/family/invitations/accept", headers=csrf(client), json={"token": invitation.json()["token"]})
+    assert joined.status_code == 200
+    assert joined.json()["status"] == "JOINED"
+    assert len(client.get(f"/v1/family/networks/{network['id']}/relationships").json()) == 1
+    items = client.get(f"/v1/family/networks/{network['id']}/items").json()
+    assert [item["title"] for item in items] == ["FAMILY"]
+    reused = client.post("/v1/family/invitations/accept", headers=csrf(client), json={"token": invitation.json()["token"]})
+    assert reused.status_code == 403
 
 
 def test_life_event_never_cascades_and_legacy_has_no_inactivity_release(signed_in):
@@ -106,6 +126,11 @@ def test_audit_is_append_only_and_reports_security_events(signed_in):
     assert any(e["action"] == "PERSON_CREATED" for e in events)
     conn = __import__("terravia.db", fromlist=["connect"]).connect()
     try:
+        import terravia.db as database
+        database.initialize()
+        assert [r[0] for r in conn.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall()] == [1, 2, 3]
+        chain = conn.execute("SELECT previous_hash,event_hash FROM audit_events ORDER BY rowid").fetchall()
+        assert all(chain[i]["previous_hash"] == chain[i-1]["event_hash"] for i in range(1, len(chain)))
         event_id = conn.execute("SELECT id FROM audit_events LIMIT 1").fetchone()["id"]
         try:
             conn.execute("DELETE FROM audit_events WHERE id=?", (event_id,))
@@ -142,3 +167,42 @@ def test_mutations_require_csrf_and_validation_is_structured(signed_in):
     invalid = client.post("/v1/auth/register", json={"email": "bad-email", "password": "a-strong-password-123"})
     assert invalid.status_code == 422
     assert invalid.json()["error"]["code"] == "VALIDATION_FAILED"
+
+
+def test_unregistered_requester_is_denied_and_cannot_buy_consent(signed_in):
+    client, _ = signed_in
+    service = next(s for s in client.get("/v1/services").json() if s["id"] == "svc-reference-contact")
+    requested = client.post("/v1/data-requests", headers=csrf(client), json={
+        "requester": "Unregistered Organization", "purpose": "Request contact verification", "legal_basis": "CONSENT",
+        "requested_fields": ["name"], "service_id": service["id"]})
+    assert requested.status_code == 201
+    assert requested.json()["policy"]["outcome"] == "DENY"
+    denied_consent = client.post(f"/v1/data-requests/{requested.json()['id']}/consents", headers=csrf(client), json={"fields": ["name"]})
+    assert denied_consent.status_code == 403
+
+
+def test_session_revocation_is_scoped_to_current_account(signed_in):
+    client, _ = signed_in
+    first = client.get("/v1/sessions").json()[0]
+    login = client.post("/v1/auth/login", json={"email": "citizen@example.test", "password": "a-strong-password-123"})
+    assert login.status_code == 200
+    sessions = client.get("/v1/sessions").json()
+    assert len(sessions) == 2
+    old = next(s for s in sessions if s["id"] == first["id"])
+    revoked = client.post(f"/v1/sessions/{old['id']}/revoke", headers=csrf(client))
+    assert revoked.status_code == 200
+    assert all(s["id"] != old["id"] for s in client.get("/v1/sessions").json())
+
+
+def test_personal_export_is_audited_and_excludes_authentication_secrets(signed_in):
+    client, person_id = signed_in
+    client.post("/v1/claims", headers=csrf(client), json={"attribute": "name", "value": "Export Citizen"})
+    exported = client.get("/v1/export")
+    assert exported.status_code == 200
+    assert exported.headers["content-disposition"].endswith("terravia-personal-data-v1.json\"")
+    data = exported.json()
+    assert data["person"]["person_id"] == person_id
+    assert data["claims"][0]["value"] == "Export Citizen"
+    assert "password_hash" not in exported.text
+    assert "token_hash" not in exported.text
+    assert any(event["action"] == "PERSONAL_DATA_EXPORTED" for event in data["activity"])
